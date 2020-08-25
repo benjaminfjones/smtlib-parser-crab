@@ -1,7 +1,7 @@
 extern crate peg;
 
 #[allow(dead_code)]
-const RESERVED_WORDS: [&'static str; 13] = [
+const RESERVED_WORDS: [&str; 13] = [
     "BINARY",
     "DECIMAL",
     "HEXADECIMAL",
@@ -55,10 +55,11 @@ peg::parser!{
         rule simple_symbol() -> &'input str
             = $((letter() / digit() / symbol_char())+)
         // any sequence of whitespace or printable chars (except | and \), enclosed in vertical bars
+        // this production returns only what's inside the bars
         rule quoted_symbol() -> &'input str
-            = $("|" quoted_symbol_char()* "|")
-        pub rule symbol() -> &'input str
-            = $(simple_symbol() / quoted_symbol())
+            = "|" qs:$(quoted_symbol_char()*) "|" { qs }
+        pub rule raw_symbol() -> &'input str
+            = simple_symbol() / quoted_symbol()
         pub rule keyword() -> &'input str
             = $(":" simple_symbol())
 
@@ -66,24 +67,20 @@ peg::parser!{
         rule spec_constant() -> &'input str
             = $(numeral() / decimal() / hexadecimal() / binary() / string())
         pub rule s_expr() -> &'input str
-            = $(spec_constant() / symbol() / keyword() / "(" _ (s_expr() ** __) _ ")")
+            = $(spec_constant() / raw_symbol() / keyword() / "(" _ (s_expr() ** __) _ ")")
 
         // identifiers
         rule index() -> &'input str
-            = $(numeral() / symbol())
+            = $(numeral() / raw_symbol())
         pub rule identifier() -> &'input str
-            = $(symbol() / "(" _ "_" _ (index() **<1,> __) _ ")")
+            = $(raw_symbol() / "(" _ "_" _ (index() **<1,> __) _ ")")
 
         // attributes
         // TODO: parse attribute values
         rule attribute_value() -> &'input str
-            = $(spec_constant() / symbol() / "(" _ (s_expr() ** __) _ ")")
+            = $(spec_constant() / raw_symbol() / "(" _ (s_expr() ** __) _ ")")
         pub rule attribute() -> Attribute
             = k:keyword() v:attribute_value()? { Attribute(Keyword(k.to_string()), v.map(|s| s.to_string())) }
-
-        // sorts
-        pub rule sort() -> &'input str
-            = $(identifier() / "(" _ identifier() _ (sort() **<1,> __) _ ")")
 
         // terms and formulas
         //
@@ -103,63 +100,56 @@ peg::parser!{
         //          | ( match <term> ( <match_case>+ ) )
         //          | ( ! <term> <attribute>+ )
         //
-        rule qual_identifier() -> &'input str
-            = $(identifier() / "(" _ "as" __ identifier() __ sort() _ ")")
-        rule var_binding() -> &'input str
-            = $("(" _ symbol() __ term() _ ")")
-        rule sorted_var() -> &'input str
-            = $("(" _ symbol() __ sort() _ ")")
-        rule pattern() -> &'input str
-            = $(symbol() / "(" _ symbol() __ (symbol() **<1,> __) _ ")")
-        rule match_case() -> &'input str
-            = $("(" _ pattern() __ term() _ ")")
+        pub rule sort() -> Sort
+            = i:identifier() { Sort(i.to_string(), Vec::new()) }
+            / "(" _ i:identifier() _ ss:(sort() **<1,> __) _ ")" { Sort(i.to_string(), ss) }
+        rule qual_identifier() -> QualIdentifier
+            = i:identifier() { QualIdentifier(i.to_string(), None) }
+            / "(" _ "as" __ i:identifier() __ s:sort() _ ")" { QualIdentifier(i.to_string(), Some(s)) }
+        pub rule symbol() -> Symbol
+            = s:raw_symbol() { Symbol(s.to_string()) }
+        rule var_binding() -> VarBinding
+            = "(" _ s:symbol() __ t:term() _ ")" { VarBinding(s, t) }
+        rule sorted_var() -> SortedVar
+            = "(" _ s:symbol() __ sort:sort() _ ")" { SortedVar(s, sort) }
+        rule pattern() -> Pattern
+            = s:symbol() { Pattern(s, Vec::new()) }
+            / "(" _ s:symbol() __ ss:(symbol() **<1,> __) _ ")" { Pattern(s, ss) }
+        rule match_case() -> MatchCase
+            = "(" _ p:pattern() __ t:term() _ ")" { MatchCase(p, t) }
         pub rule term() -> Term
-            = s:spec_constant() { Term::spec_constant(s) }
-            / i:qual_identifier() { Term::qual_identifier(i) }
-            / "(" _ i:qual_identifier() __ ts:(term() **<1,> __) _ ")" { Term::app(i, ts) }
-            // / "(" _ "let" __ "(" vbs:(var_binding() **<1,> __) t:term() _ ")" { Term::let(vbs, t) }
-            // / "(" _ "forall" __ "(" svs:(sorted_var() **<1,> __) t:term() _ ")" { Term::forall(svs, t) }
-            // / "(" _ "exists" __ "(" svs:(sorted_var() **<1,> __) t:term() _ ")" { Term::exists(svs, t) }
-            // / "(" _ "match" __ t:term() "(" mcs:(match_case() **<1,> __) _ ")" { Term::mtch(t, mcs) }
-            // / "(" _ "!" __ t:term() as:(attribute() **<1,> __) _ ")" { Term::bang(t, as) }
+            = s:spec_constant() { Term::SpecConstant(s.to_string()) }
+            / qi:qual_identifier() { Term::QualIdentifier(qi) }
+            / "(" _ qi:qual_identifier() __ ts:(term() **<1,> __) _ ")" { Term::App(qi, ts) }
+            / "(" _ "let" __ "(" vbs:(var_binding() **<1,> __) t:term() _ ")" { Term::Let(vbs, Box::new(t)) }
+            / "(" _ "forall" __ "(" svs:(sorted_var() **<1,> __) t:term() _ ")" { Term::Forall(svs, Box::new(t)) }
+            / "(" _ "exists" __ "(" svs:(sorted_var() **<1,> __) t:term() _ ")" { Term::Exists(svs, Box::new(t)) }
+            / "(" _ "match" __ t:term() "(" mcs:(match_case() **<1,> __) _ ")" { Term::Match(Box::new(t), mcs) }
+            / "(" _ "!" __ t:term() attrs:(attribute() **<1,> __) _ ")" { Term::Bang(Box::new(t), attrs) }
     }
 }
 
 // newtypes for use in Term
+#[derive(Debug, Eq, PartialEq)]
 pub struct Symbol(String);
-pub struct Sort(String);
-pub struct VarBinding(Symbol, Box<Term>);
+pub struct Sort(String, Vec<Sort>);
+pub struct QualIdentifier(String, Option<Sort>);  // identifier name, sort
+pub struct VarBinding(Symbol, Term);
 pub struct SortedVar(Symbol, Sort);
 pub struct Pattern(Symbol, Vec<Symbol>);
-pub struct MatchCase(Pattern, Box<Term>);
+pub struct MatchCase(Pattern, Term);
 pub struct Keyword(String);
 pub struct Attribute(Keyword, Option<String>);
 
 pub enum Term {
     SpecConstant(String),
-    QualIdentifier(String),
-    App(String, Vec<Box<Term>>),
+    QualIdentifier(QualIdentifier),
+    App(QualIdentifier, Vec<Term>),
     Let(Vec<VarBinding>, Box<Term>),
     Forall(Vec<SortedVar>, Box<Term>),
     Exists(Vec<SortedVar>, Box<Term>),
     Match(Box<Term>, Vec<MatchCase>),
     Bang(Box<Term>, Vec<Attribute>),
-}
-
-impl Term {
-    pub fn spec_constant(s: &str) -> Self {
-        Term::SpecConstant(s.to_string())
-    }
-
-    pub fn qual_identifier(s: &str) -> Self {
-        Term::QualIdentifier(s.to_string())
-    }
-
-    pub fn app(i: &str, ts: Vec<Term>) -> Self {
-        Term::App(i.to_string(), ts.into_iter().map(|t| Box::new(t)).collect())
-    }
-
-    // TODO: finish the rest of the smart constructors
 }
 
 #[cfg(test)]
@@ -222,25 +212,29 @@ mod test {
 
     #[test]
     fn test_symbol() {
-        assert_eq!(smtlib_parser::symbol("|symbol|"), Ok("|symbol|"));
-        assert!(smtlib_parser::symbol("FOOBAR").is_ok());
-        assert!(smtlib_parser::symbol("!foo").is_ok());
-        assert!(smtlib_parser::symbol("~~~").is_ok());
-        assert!(smtlib_parser::symbol("foo01").is_ok());
-        assert!(smtlib_parser::symbol("BINARY").is_ok());  // parses OK, but shouldn't validate
-        assert!(smtlib_parser::symbol("1.0").is_ok());     // parses OK, but doesn't validate
-        assert!(smtlib_parser::symbol("0foo").is_ok());    // parses OK, but doesn't validate
-        assert!(smtlib_parser::symbol("|foo\"bar|").is_ok());
-        assert!(smtlib_parser::symbol("||").is_ok());
-        assert!(smtlib_parser::symbol(r#"|af klj ^*0 asfe2 (&*)&(#^ $ > > >?" ’]]984|"#).is_ok());
+        assert_eq!(smtlib_parser::raw_symbol("|symbol|"), Ok("symbol"));
+        assert!(smtlib_parser::raw_symbol("FOOBAR").is_ok());
+        assert!(smtlib_parser::raw_symbol("!foo").is_ok());
+        assert!(smtlib_parser::raw_symbol("~~~").is_ok());
+        assert!(smtlib_parser::raw_symbol("foo01").is_ok());
+        assert!(smtlib_parser::raw_symbol("BINARY").is_ok());  // parses OK, but shouldn't validate
+        assert!(smtlib_parser::raw_symbol("1.0").is_ok());     // parses OK, but doesn't validate
+        assert!(smtlib_parser::raw_symbol("0foo").is_ok());    // parses OK, but doesn't validate
+        assert!(smtlib_parser::raw_symbol("|foo\"bar|").is_ok());
+        assert!(smtlib_parser::raw_symbol("||").is_ok());
+        assert!(smtlib_parser::raw_symbol(r#"|af klj ^*0 asfe2 (&*)&(#^ $ > > >?" ’]]984|"#).is_ok());
+
+        assert_eq!(smtlib_parser::symbol("foo"), Ok(Symbol("foo".to_string())));
+        // quoted symbols parse into the value inside the quotes
+        assert_eq!(smtlib_parser::symbol("|foo|"), Ok(Symbol("foo".to_string())));
 
         let multi_line = r#"|this is a symbol
         with a line break in it|"#;
-        assert!(smtlib_parser::symbol(multi_line).is_ok());
+        assert!(smtlib_parser::raw_symbol(multi_line).is_ok());
 
         // negative parses
-        assert!(smtlib_parser::symbol("|sym|ol|").is_err());
-        assert!(smtlib_parser::symbol(r#"|sym\ol|"#).is_err());
+        assert!(smtlib_parser::raw_symbol("|sym|ol|").is_err());
+        assert!(smtlib_parser::raw_symbol(r#"|sym\ol|"#).is_err());
     }
 
     #[test]
@@ -290,5 +284,9 @@ mod test {
         assert!(smtlib_parser::identifier("(move over there)").is_err());
     }
 
-    // TODO: test term()
+    #[test]
+    fn test_term() {
+        assert!(smtlib_parser::term("foo").is_ok());
+        // TODO: test more!
+    }
 }
