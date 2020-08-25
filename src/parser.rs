@@ -18,7 +18,7 @@ const RESERVED_WORDS: [&str; 13] = [
     // TODO: add script commands
 ];
 
-peg::parser!{
+peg::parser! {
     pub grammar smtlib_parser() for str {
         rule whitespace_char() = quiet!{[' ' | '\t' | '\n' | '\r']}
         rule _() = quiet!{whitespace_char()*}   // optional whitespace
@@ -80,7 +80,9 @@ peg::parser!{
         rule attribute_value() -> &'input str
             = $(spec_constant() / raw_symbol() / "(" _ (s_expr() ** __) _ ")")
         pub rule attribute() -> Attribute
-            = k:keyword() v:attribute_value()? { Attribute(Keyword(k.to_string()), v.map(|s| s.to_string())) }
+            = k:keyword() { Attribute(Keyword(k.to_string()), None) }
+            / k:keyword() __ v:attribute_value()
+                { Attribute(Keyword(k.to_string()), Some(v.to_string())) }
 
         // terms and formulas
         //
@@ -102,7 +104,7 @@ peg::parser!{
         //
         pub rule sort() -> Sort
             = i:identifier() { Sort(i.to_string(), Vec::new()) }
-            / "(" _ i:identifier() _ ss:(sort() **<1,> __) _ ")" { Sort(i.to_string(), ss) }
+            / "(" _ i:identifier() __ ss:(sort() **<1,> __) _ ")" { Sort(i.to_string(), ss) }
         rule qual_identifier() -> QualIdentifier
             = i:identifier() { QualIdentifier(i.to_string(), None) }
             / "(" _ "as" __ i:identifier() __ s:sort() _ ")" { QualIdentifier(i.to_string(), Some(s)) }
@@ -120,35 +122,52 @@ peg::parser!{
         pub rule term() -> Term
             = s:spec_constant() { Term::SpecConstant(s.to_string()) }
             / qi:qual_identifier() { Term::QualIdentifier(qi) }
+            / "(" _ "let" __ "(" vbs:(var_binding() **<1,> _) _ ")" __ t:term() _ ")" { Term::Let(vbs, Box::new(t)) }
+            / "(" _ "forall" __ "(" svs:(sorted_var() **<1,> __) _ ")" __ t:term() _ ")" { Term::Forall(svs, Box::new(t)) }
+            / "(" _ "exists" __ "(" svs:(sorted_var() **<1,> __) _ ")" __ t:term() _ ")" { Term::Exists(svs, Box::new(t)) }
+            / "(" _ "match" __ t:term() __ "(" _ mcs:(match_case() **<1,> __) _ ")" _ ")" { Term::Match(Box::new(t), mcs) }
+            / "(" _ "!" __ t:term() __ attrs:(attribute() **<1,> __) _ ")" { Term::Bang(Box::new(t), attrs) }
             / "(" _ qi:qual_identifier() __ ts:(term() **<1,> __) _ ")" { Term::App(qi, ts) }
-            / "(" _ "let" __ "(" vbs:(var_binding() **<1,> __) t:term() _ ")" { Term::Let(vbs, Box::new(t)) }
-            / "(" _ "forall" __ "(" svs:(sorted_var() **<1,> __) t:term() _ ")" { Term::Forall(svs, Box::new(t)) }
-            / "(" _ "exists" __ "(" svs:(sorted_var() **<1,> __) t:term() _ ")" { Term::Exists(svs, Box::new(t)) }
-            / "(" _ "match" __ t:term() "(" mcs:(match_case() **<1,> __) _ ")" { Term::Match(Box::new(t), mcs) }
-            / "(" _ "!" __ t:term() attrs:(attribute() **<1,> __) _ ")" { Term::Bang(Box::new(t), attrs) }
     }
 }
 
 // newtypes for use in Term
 #[derive(Debug, Eq, PartialEq)]
 pub struct Symbol(String);
+#[derive(Debug, Eq, PartialEq)]
 pub struct Sort(String, Vec<Sort>);
-pub struct QualIdentifier(String, Option<Sort>);  // identifier name, sort
+#[derive(Debug, Eq, PartialEq)]
+pub struct QualIdentifier(String, Option<Sort>); // identifier name, sort
+#[derive(Debug, Eq, PartialEq)]
 pub struct VarBinding(Symbol, Term);
+#[derive(Debug, Eq, PartialEq)]
 pub struct SortedVar(Symbol, Sort);
+#[derive(Debug, Eq, PartialEq)]
 pub struct Pattern(Symbol, Vec<Symbol>);
+#[derive(Debug, Eq, PartialEq)]
 pub struct MatchCase(Pattern, Term);
+#[derive(Debug, Eq, PartialEq)]
 pub struct Keyword(String);
+#[derive(Debug, Eq, PartialEq)]
 pub struct Attribute(Keyword, Option<String>);
 
+#[derive(Debug, Eq, PartialEq)]
 pub enum Term {
+    /// Constant
     SpecConstant(String),
+    /// Bare identifier
     QualIdentifier(QualIdentifier),
+    /// Function application
     App(QualIdentifier, Vec<Term>),
+    /// Let binding
     Let(Vec<VarBinding>, Box<Term>),
+    /// Universal quantifier
     Forall(Vec<SortedVar>, Box<Term>),
+    /// Existential quantifier
     Exists(Vec<SortedVar>, Box<Term>),
+    /// Match for algebraic datatypes (rare in QF_LIA)
     Match(Box<Term>, Vec<MatchCase>),
+    /// Annotated Term (rare in QF_LIA)
     Bang(Box<Term>, Vec<Attribute>),
 }
 
@@ -202,8 +221,14 @@ mod test {
     #[test]
     fn test_string() {
         assert_eq!(smtlib_parser::string("\"hello\""), Ok("\"hello\""));
-        assert_eq!(smtlib_parser::string("\"hello world\""), Ok("\"hello world\""));
-        assert_eq!(smtlib_parser::string("\"she said \"\"hello world\"\"\""), Ok("\"she said \"\"hello world\"\"\""));
+        assert_eq!(
+            smtlib_parser::string("\"hello world\""),
+            Ok("\"hello world\"")
+        );
+        assert_eq!(
+            smtlib_parser::string("\"she said \"\"hello world\"\"\""),
+            Ok("\"she said \"\"hello world\"\"\"")
+        );
         let multi_line = r#""this is a string literal
         with a line break in it""#;
         assert_eq!(smtlib_parser::string(multi_line), Ok(multi_line));
@@ -217,16 +242,21 @@ mod test {
         assert!(smtlib_parser::raw_symbol("!foo").is_ok());
         assert!(smtlib_parser::raw_symbol("~~~").is_ok());
         assert!(smtlib_parser::raw_symbol("foo01").is_ok());
-        assert!(smtlib_parser::raw_symbol("BINARY").is_ok());  // parses OK, but shouldn't validate
-        assert!(smtlib_parser::raw_symbol("1.0").is_ok());     // parses OK, but doesn't validate
-        assert!(smtlib_parser::raw_symbol("0foo").is_ok());    // parses OK, but doesn't validate
+        assert!(smtlib_parser::raw_symbol("BINARY").is_ok()); // parses OK, but shouldn't validate
+        assert!(smtlib_parser::raw_symbol("1.0").is_ok()); // parses OK, but doesn't validate
+        assert!(smtlib_parser::raw_symbol("0foo").is_ok()); // parses OK, but doesn't validate
         assert!(smtlib_parser::raw_symbol("|foo\"bar|").is_ok());
         assert!(smtlib_parser::raw_symbol("||").is_ok());
-        assert!(smtlib_parser::raw_symbol(r#"|af klj ^*0 asfe2 (&*)&(#^ $ > > >?" ’]]984|"#).is_ok());
+        assert!(
+            smtlib_parser::raw_symbol(r#"|af klj ^*0 asfe2 (&*)&(#^ $ > > >?" ’]]984|"#).is_ok()
+        );
 
         assert_eq!(smtlib_parser::symbol("foo"), Ok(Symbol("foo".to_string())));
         // quoted symbols parse into the value inside the quotes
-        assert_eq!(smtlib_parser::symbol("|foo|"), Ok(Symbol("foo".to_string())));
+        assert_eq!(
+            smtlib_parser::symbol("|foo|"),
+            Ok(Symbol("foo".to_string()))
+        );
 
         let multi_line = r#"|this is a symbol
         with a line break in it|"#;
@@ -266,6 +296,7 @@ mod test {
         assert!(smtlib_parser::s_expr("(+ 1 x)").is_ok());
         assert!(smtlib_parser::s_expr("(+ 1 (+ 1 x))").is_ok());
         assert!(smtlib_parser::s_expr("((hello)  (world) )").is_ok());
+        assert!(smtlib_parser::s_expr("(match (+ 1 x) ((y (+ 1 y))))").is_ok());
 
         assert!(smtlib_parser::s_expr("(+ 1 x").is_err());
         assert!(smtlib_parser::s_expr("(+ 1 x))").is_err());
@@ -279,14 +310,86 @@ mod test {
         assert!(smtlib_parser::identifier("|zeke|").is_ok());
         assert!(smtlib_parser::identifier("(_ move over)").is_ok());
         assert!(smtlib_parser::identifier("(_ move over there)").is_ok());
-        assert!(smtlib_parser::identifier("1.0").is_ok());  // parses OK, but doesn't validate
+        assert!(smtlib_parser::identifier("1.0").is_ok()); // parses OK, but doesn't validate
 
         assert!(smtlib_parser::identifier("(move over there)").is_err());
     }
 
     #[test]
     fn test_term() {
+        // dummy term for comparison:
+        // Ok(Term::QualIdentifier(QualIdentifier("x".to_string(), None)))
         assert!(smtlib_parser::term("foo").is_ok());
-        // TODO: test more!
+        assert!(smtlib_parser::term("(+ 1 (+ x 1))").is_ok());
+        assert!(smtlib_parser::term("(+ (+ 1 x) x)").is_ok());
+        assert!(smtlib_parser::term("(let (( y (+ 1 x))) (+ 1 y))").is_ok());
+        assert_eq!(
+            smtlib_parser::term("(forall ((x Int)) (> (+ 1 x) x))"),
+            Ok(Term::Forall(
+                vec![SortedVar(
+                    Symbol("x".to_string()),
+                    Sort("Int".to_string(), vec![])
+                )],
+                Box::new(Term::App(
+                    QualIdentifier(">".to_string(), None),
+                    vec![
+                        Term::App(
+                            QualIdentifier("+".to_string(), None),
+                            vec![
+                                Term::SpecConstant("1".to_string()),
+                                Term::QualIdentifier(QualIdentifier("x".to_string(), None))
+                            ]
+                        ),
+                        Term::QualIdentifier(QualIdentifier("x".to_string(), None))
+                    ]
+                ))
+            ))
+        );
+        assert!(smtlib_parser::term("(exists ((x Int)) (> (+ 1 x) x))").is_ok());
+        assert!(smtlib_parser::term("(exists ((x Int) (y Int)) (> (+ 1 x) y))").is_ok());
+        assert!(smtlib_parser::term("(forall ((x Int)) (exists ((y Int)) (> (+ 1 x) y)))").is_ok());
+        assert!(smtlib_parser::term("(match (+ 1 x) ((y (+ 1 y))))").is_ok());
+        assert!(smtlib_parser::term("(cons \"abc\" (as nil (List String)))").is_ok());
+        assert!(smtlib_parser::term("(select (as @a1 (Array Int Int)) 3)").is_ok());
+        assert!(smtlib_parser::term("(! x :foo :bar)").is_ok());
+
+        assert!(smtlib_parser::term(
+            r#"( forall (( x ( List Int )) ( y ( List Int )))
+                                         (= ( append x y )
+                                            ( ite (= x ( as nil ( List Int )))
+                                                  y
+                                                  ( let (( h ( head x )) ( t ( tail x )))
+                                                    ( insert h ( append t y ))))))"#
+        )
+        .is_ok());
+
+        // TODO: this parses, but should not validate b/c "exists" is not a valid application
+        // identifier
+        assert!(smtlib_parser::term("(exists x Int (> (+ 1 x) x))").is_ok());
+
+        assert!(smtlib_parser::term("(exists ((x Int) (> (+ 1 x) x))").is_err()); // missing )
+        assert!(smtlib_parser::term("exists ((x Int) (> (+ 1 x) x))").is_err()); // missing (
+        assert!(smtlib_parser::term("(match(+ 1 x)( (y (+ 1 y)) ))").is_err()); // not enough space
+                                                                                // (const - array 0.0) is a malformed identifier
+        assert!(smtlib_parser::term("(= a (as (const - array 0.0) (Array Int Real)))").is_err());
     }
+
+    // TODO: other random expressions to parse
+    //
+    // ; Axiom for list append : version 1
+    // ; List is a parametric datatype
+    // ; with constructors " nil " and " cons "
+    // ;
+    // ( forall (( l1 ( List Int )) ( l2 ( List Int )))
+    //   (= ( append l1 l2 )
+    //      ( match l1 (
+    //        ( nil l2 )
+    //        (( cons h t ) ( cons h ( append t l2 )))))))
+    //
+    // ; Axiom for list append : version 2
+    // ( forall (( l1 ( List Int )) ( l2 ( List Int )))
+    //   (= ( append l1 l2 )
+    //     ( match l1 (
+    //       (( cons h t ) ( cons h ( append t l2 )))
+    //       ( _ l2 ))))) ; _ is a variable
 }
